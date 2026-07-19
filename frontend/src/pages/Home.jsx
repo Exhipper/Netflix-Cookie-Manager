@@ -1,6 +1,7 @@
 import React, { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import axios from 'axios'
+import { CookieChecker } from '../components/CookieChecker'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -64,7 +65,6 @@ export const Home = () => {
   const plans = ['All Plans', 'Premium', 'Standard', 'Basic', 'Standard with Ads']
   
   const cookies = cookiesData?.cookies || []
-  const total = cookiesData?.total || 0
 
   // Filter and search
   const filteredCookies = cookies.filter(c => {
@@ -97,6 +97,11 @@ export const Home = () => {
 
   return (
     <div className="container mx-auto px-4 py-6">
+      {/* Cookie Checker Section */}
+      <div className="mb-8">
+        <CookieChecker />
+      </div>
+
       {/* Stats Bar */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-6">
         <div className="bg-gray-800 rounded-lg p-4 text-center">
