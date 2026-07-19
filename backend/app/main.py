@@ -28,13 +28,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Database Setup
+# Database Setup - FIXED
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Fix: Replace postgres:// with postgresql:// for SQLAlchemy
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if not DATABASE_URL:
     # Fallback to SQLite for local development
     DATABASE_URL = "sqlite:///./cookies.db"
 
-engine = create_engine(DATABASE_URL)
+# PostgreSQL requires specific driver
+if DATABASE_URL.startswith("postgresql"):
+    # Ensure we're using the right driver
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+else:
+    engine = create_engine(DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -54,7 +65,12 @@ class CookieDB(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-Base.metadata.create_all(bind=engine)
+# Create tables
+try:
+    Base.metadata.create_all(bind=engine)
+    print("Database tables created successfully")
+except Exception as e:
+    print(f"Error creating tables: {e}")
 
 # Pydantic Schemas
 class CookieBase(BaseModel):
