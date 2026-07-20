@@ -12,7 +12,16 @@ import urllib.parse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.sql import func
 from cryptography.fernet import Fernet
+
+# ============================================
+# IMPORT THE CHECKER SERVICE
+# ============================================
+from app.services.cookie_checker import CookieChecker
+
+# Initialize the checker once
+cookie_checker = CookieChecker()
 
 app = FastAPI(title="Netflix Cookie Manager API")
 
@@ -131,6 +140,10 @@ class ValidationResponse(BaseModel):
     quality: Optional[str] = None
     message: Optional[str] = None
     error: Optional[str] = None
+    nftoken: Optional[str] = None
+    login_url: Optional[str] = None
+    cookie_id: Optional[int] = None
+    is_new: Optional[bool] = None
 
 class BulkAddRequest(BaseModel):
     cookies: List[str]
@@ -181,10 +194,10 @@ async def health_check():
     }
 
 # ============================================
-# COOKIE VALIDATION
+# COOKIE VALIDATION (LEGACY, KEPT FOR COMPATIBILITY)
 # ============================================
 @app.post("/api/v1/cookies/validate", response_model=ValidationResponse)
-async def validate_cookie(request: CookieValidateRequest):
+async def validate_cookie_legacy(request: CookieValidateRequest):
     cookie_data = request.cookie
     if not cookie_data or len(cookie_data) < 10:
         return ValidationResponse(valid=False, error="Invalid cookie format - cookie too short")
@@ -192,7 +205,6 @@ async def validate_cookie(request: CookieValidateRequest):
     netflix_id = None
     secure_id = None
 
-    # 1. Header format
     parts = cookie_data.split(';')
     for part in parts:
         part = part.strip()
@@ -201,7 +213,6 @@ async def validate_cookie(request: CookieValidateRequest):
         elif 'SecureNetflixId=' in part:
             secure_id = part.split('=')[1].strip()
 
-    # 2. JSON format
     if not netflix_id and not secure_id:
         try:
             cookie_json = json.loads(cookie_data)
@@ -210,7 +221,6 @@ async def validate_cookie(request: CookieValidateRequest):
         except:
             pass
 
-    # 3. Netscape format
     if not netflix_id and not secure_id:
         lines = cookie_data.split('\n')
         for line in lines:
@@ -225,7 +235,6 @@ async def validate_cookie(request: CookieValidateRequest):
                     elif name == 'SecureNetflixId':
                         secure_id = value
 
-    # 4. URL-encoded
     if not netflix_id and not secure_id:
         try:
             decoded = urllib.parse.unquote(cookie_data)
@@ -260,7 +269,7 @@ async def validate_cookie(request: CookieValidateRequest):
             expiry="2026-12-31",
             screens=4,
             quality="4K",
-            message="Cookie validated successfully"
+            message="Cookie validated successfully (legacy)"
         )
 
     return ValidationResponse(
@@ -269,58 +278,156 @@ async def validate_cookie(request: CookieValidateRequest):
     )
 
 # ============================================
-# GENERATE ACCOUNT
+# NEW: VALIDATE AND GENERATE WITH REAL CHECKER
+# ============================================
+@app.post("/api/v1/validate-and-generate", response_model=ValidationResponse)
+async def validate_and_generate(request: CookieValidateRequest):
+    """
+    Validate a cookie and generate NFToken with real account info
+    Uses the Netflix-Cookie-Checker library
+    """
+    cookie_data = request.cookie
+    
+    if not cookie_data or len(cookie_data) < 10:
+        return ValidationResponse(
+            valid=False,
+            error="Invalid cookie format - cookie too short"
+        )
+    
+    # Detect format
+    cookie_format = "header"
+    if '{' in cookie_data and '}' in cookie_data:
+        try:
+            json.loads(cookie_data)
+            cookie_format = "json"
+        except:
+            pass
+    elif '\t' in cookie_data:
+        cookie_format = "netscape"
+    
+    # Run the checker
+    result = cookie_checker.validate_and_extract(cookie_data, cookie_format)
+    
+    # If valid and we have account info, store it in database
+    if result.get("valid"):
+        db = SessionLocal()
+        try:
+            # Check if cookie already exists (by plan and country - simplistic)
+            existing = db.query(CookieDB).filter(
+                CookieDB.plan == result.get("plan"),
+                CookieDB.country == result.get("country")
+            ).first()
+            
+            if not existing:
+                # Store the validated cookie
+                encrypted_cookie = encrypt_cookie(cookie_data)
+                expiry_date = None
+                if result.get("expiry"):
+                    try:
+                        expiry_date = datetime.strptime(result["expiry"], "%Y-%m-%d")
+                    except:
+                        pass
+                
+                new_cookie = CookieDB(
+                    cookie_encrypted=encrypted_cookie,
+                    plan=result.get("plan", "Unknown"),
+                    status="live",
+                    country=result.get("country", "Unknown"),
+                    expiry_date=expiry_date,
+                    screen_count=result.get("screens", 4),
+                    quality=result.get("quality", "4K"),
+                    last_checked_at=datetime.utcnow()
+                )
+                db.add(new_cookie)
+                db.commit()
+                db.refresh(new_cookie)
+                result["cookie_id"] = new_cookie.id
+                result["is_new"] = True
+            else:
+                result["cookie_id"] = existing.id
+                result["is_new"] = False
+                result["message"] = "Account already exists in database"
+        except Exception as e:
+            db.rollback()
+            print(f"Error storing cookie: {e}")
+        finally:
+            db.close()
+    
+    # Ensure the response includes the NFToken and login_url
+    if result.get("valid"):
+        return ValidationResponse(
+            valid=True,
+            plan=result.get("plan"),
+            country=result.get("country"),
+            status=result.get("status"),
+            expiry=result.get("expiry"),
+            screens=result.get("screens"),
+            quality=result.get("quality"),
+            nftoken=result.get("nftoken"),
+            login_url=result.get("login_url"),
+            cookie_id=result.get("cookie_id"),
+            is_new=result.get("is_new", False),
+            message=result.get("message", "Cookie validated and stored")
+        )
+    else:
+        return ValidationResponse(
+            valid=False,
+            error=result.get("error", "Validation failed")
+        )
+
+# ============================================
+# GENERATE ACCOUNT USING EXISTING COOKIE
 # ============================================
 @app.post("/api/v1/generate", response_model=Dict[str, Any])
 async def generate_account():
-    plans = ["Premium", "Standard", "Basic", "Standard with Ads"]
-    countries = ["US", "UK", "CA", "DE", "FR", "AU", "BR", "MX"]
-    qualities = ["4K", "1080p", "720p", "480p"]
-    screen_counts = [4, 2, 1, 4, 2]
-
-    plan = random.choice(plans)
-    country = random.choice(countries)
-    quality = random.choice(qualities)
-    screens = random.choice(screen_counts)
-
-    token_id = hashlib.md5(f"{plan}{country}{datetime.now()}".encode()).hexdigest()[:16]
-    nftoken = f"nftoken_{token_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    mock_cookie = f"NetflixId=mock_{token_id}; SecureNetflixId=mock_secure_{token_id}; nfvdid=mock_vid_{token_id}"
-
+    """
+    Generate a Netflix account by using a stored valid cookie
+    """
     db = SessionLocal()
     try:
-        encrypted_cookie = encrypt_cookie(mock_cookie)
-        expiry_date = datetime(2026, 12, 31)
-        new_cookie = CookieDB(
-            cookie_encrypted=encrypted_cookie,
-            plan=plan,
-            status="live",
-            country=country,
-            expiry_date=expiry_date,
-            screen_count=screens,
-            quality=quality,
-            last_checked_at=datetime.utcnow()
-        )
-        db.add(new_cookie)
-        db.commit()
-        db.refresh(new_cookie)
+        # Get a random valid cookie from the database
+        cookie = db.query(CookieDB).filter(
+            CookieDB.status == "live"
+        ).order_by(func.random()).first()
+        
+        if not cookie:
+            return {
+                "error": "No valid cookies available. Please add a cookie first.",
+                "valid": False
+            }
+        
+        # Decrypt and validate
+        decrypted = decrypt_cookie(cookie.cookie_encrypted)
+        result = cookie_checker.validate_and_extract(decrypted, "header")
+        
+        if result.get("valid"):
+            return {
+                "plan": result.get("plan"),
+                "country": result.get("country"),
+                "quality": result.get("quality"),
+                "screens": result.get("screens"),
+                "nftoken": result.get("nftoken"),
+                "login_url": result.get("login_url"),
+                "cookie_id": cookie.id,
+                "is_new": False,
+                "message": "Account retrieved from existing cookie",
+                "valid": True
+            }
+        else:
+            # Mark as invalid in database
+            cookie.status = "die"
+            db.commit()
+            return {
+                "error": "Selected cookie is no longer valid",
+                "valid": False
+            }
     except Exception as e:
-        db.rollback()
-        print(f"Error saving generated cookie: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save generated account")
+        return {
+            "error": f"Error generating account: {str(e)}",
+            "valid": False
+        }
     finally:
         db.close()
-
-    return {
-        "plan": plan,
-        "country": country,
-        "quality": quality,
-        "screens": screens,
-        "nftoken": nftoken,
-        "login_url": f"https://www.netflix.com/?nftoken={nftoken}",
-        "cookie_id": new_cookie.id,
-        "message": "Account generated successfully!"
-    }
 
 # ============================================
 # BULK ADD COOKIES
@@ -337,29 +444,29 @@ async def bulk_add_cookies(request: BulkAddRequest):
 
     for cookie_str in request.cookies:
         try:
-            # Validate each cookie
-            validation = await validate_cookie(CookieValidateRequest(cookie=cookie_str))
-            if not validation.valid:
+            # Use the real checker to validate
+            result = cookie_checker.validate_and_extract(cookie_str, "header")
+            if not result.get("valid"):
                 failed += 1
                 errors.append(f"Invalid: {cookie_str[:30]}...")
                 continue
 
             encrypted = encrypt_cookie(cookie_str)
             expiry_date = None
-            if validation.expiry:
+            if result.get("expiry"):
                 try:
-                    expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
+                    expiry_date = datetime.strptime(result["expiry"], "%Y-%m-%d")
                 except:
                     pass
 
             new_cookie = CookieDB(
                 cookie_encrypted=encrypted,
-                plan=validation.plan or "Unknown",
+                plan=result.get("plan", "Unknown"),
                 status="live",
-                country=validation.country or "Unknown",
+                country=result.get("country", "Unknown"),
                 expiry_date=expiry_date,
-                screen_count=validation.screens,
-                quality=validation.quality,
+                screen_count=result.get("screens", 4),
+                quality=result.get("quality", "4K"),
                 last_checked_at=datetime.utcnow()
             )
             db.add(new_cookie)
@@ -380,7 +487,7 @@ async def bulk_add_cookies(request: BulkAddRequest):
         "message": f"Bulk add completed: {added} added, {failed} failed",
         "added": added,
         "failed": failed,
-        "errors": errors[:10]  # return first 10 errors
+        "errors": errors[:10]
     }
 
 # ============================================
@@ -397,16 +504,16 @@ async def recheck_all_cookies():
         for cookie in cookies:
             try:
                 decrypted = decrypt_cookie(cookie.cookie_encrypted)
-                validation = await validate_cookie(CookieValidateRequest(cookie=decrypted))
-                if validation.valid:
+                result = cookie_checker.validate_and_extract(decrypted, "header")
+                if result.get("valid"):
                     cookie.status = "live"
-                    cookie.plan = validation.plan or cookie.plan
-                    cookie.country = validation.country or cookie.country
-                    cookie.screen_count = validation.screens or cookie.screen_count
-                    cookie.quality = validation.quality or cookie.quality
-                    if validation.expiry:
+                    cookie.plan = result.get("plan") or cookie.plan
+                    cookie.country = result.get("country") or cookie.country
+                    cookie.screen_count = result.get("screens") or cookie.screen_count
+                    cookie.quality = result.get("quality") or cookie.quality
+                    if result.get("expiry"):
                         try:
-                            cookie.expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
+                            cookie.expiry_date = datetime.strptime(result["expiry"], "%Y-%m-%d")
                         except:
                             pass
                 else:
@@ -436,26 +543,27 @@ async def recheck_all_cookies():
 async def submit_cookie(request: CookieCreate):
     db = SessionLocal()
     try:
-        validation = await validate_cookie(CookieValidateRequest(cookie=request.cookie))
-        if not validation.valid:
-            raise HTTPException(status_code=400, detail=validation.error or "Invalid cookie")
+        # Use real checker
+        result = cookie_checker.validate_and_extract(request.cookie, "header")
+        if not result.get("valid"):
+            raise HTTPException(status_code=400, detail=result.get("error", "Invalid cookie"))
 
         encrypted_cookie = encrypt_cookie(request.cookie)
         expiry_date = None
-        if validation.expiry:
+        if result.get("expiry"):
             try:
-                expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
+                expiry_date = datetime.strptime(result["expiry"], "%Y-%m-%d")
             except:
                 pass
 
         new_cookie = CookieDB(
             cookie_encrypted=encrypted_cookie,
-            plan=validation.plan or "Unknown",
+            plan=result.get("plan", "Unknown"),
             status="live",
-            country=validation.country or "Unknown",
+            country=result.get("country", "Unknown"),
             expiry_date=expiry_date,
-            screen_count=validation.screens,
-            quality=validation.quality,
+            screen_count=result.get("screens", 4),
+            quality=result.get("quality", "4K"),
             last_checked_at=datetime.utcnow()
         )
         db.add(new_cookie)
@@ -532,12 +640,12 @@ async def refresh_cookie(cookie_id: int):
         if not cookie:
             raise HTTPException(status_code=404, detail="Cookie not found")
         decrypted = decrypt_cookie(cookie.cookie_encrypted)
-        validation = await validate_cookie(CookieValidateRequest(cookie=decrypted))
-        cookie.status = "live" if validation.valid else "die"
+        result = cookie_checker.validate_and_extract(decrypted, "header")
+        cookie.status = "live" if result.get("valid") else "die"
         cookie.last_checked_at = datetime.utcnow()
-        if validation.valid:
-            cookie.plan = validation.plan or cookie.plan
-            cookie.country = validation.country or cookie.country
+        if result.get("valid"):
+            cookie.plan = result.get("plan") or cookie.plan
+            cookie.country = result.get("country") or cookie.country
         db.commit()
         db.refresh(cookie)
         return {
@@ -563,21 +671,24 @@ async def delete_cookie(cookie_id: int):
         db.close()
 
 # ============================================
-# NFToken GENERATION
+# NFToken GENERATION (STANDALONE)
 # ============================================
 @app.post("/api/v1/nftoken", response_model=Dict[str, Any])
 async def generate_nftoken(request: CookieValidateRequest):
     cookie_data = request.cookie
     if not cookie_data or len(cookie_data) < 10:
         raise HTTPException(status_code=400, detail="Invalid cookie")
-    token_hash = hashlib.md5(cookie_data.encode()).hexdigest()[:16]
-    mock_token = f"nftoken_{token_hash}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    return {
-        "nftoken": mock_token,
-        "login_url": f"https://www.netflix.com/?nftoken={mock_token}",
-        "expires_in": "24h",
-        "valid": True
-    }
+    # Use the checker to get real NFToken
+    result = cookie_checker.validate_and_extract(cookie_data, "header")
+    if result.get("valid"):
+        return {
+            "nftoken": result.get("nftoken"),
+            "login_url": result.get("login_url"),
+            "expires_in": "24h",
+            "valid": True
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Invalid cookie")
 
 # ============================================
 # STATISTICS
