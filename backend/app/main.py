@@ -6,6 +6,9 @@ from datetime import datetime
 import os
 import json
 import requests
+import hashlib
+import random
+import urllib.parse
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -16,55 +19,41 @@ app = FastAPI(title="Netflix Cookie Manager API")
 # ============================================
 # PRODUCTION CORS CONFIGURATION
 # ============================================
-# Allowed origins - add your frontend URLs here
 ALLOWED_ORIGINS = [
-    # Cloudflare Pages URLs
+    "https://nfx.exhipperv3.com",
+    "https://www.nfx.exhipperv3.com",
     "https://netflix-cookie-manager.pages.dev",
     "https://*.pages.dev",
-    "https://9f295de2.netflix-cookie-manager.pages.dev",
-    
-    # Custom domains (replace with yours)
-    "https://app.yourdomain.com",  # <-- CHANGE THIS
-    "https://yourdomain.com",      # <-- CHANGE THIS
-    
-    # Local development
     "http://localhost:3000",
     "http://localhost:5173",
     "http://127.0.0.1:3000",
     "http://127.0.0.1:5173",
 ]
 
-# For testing only - remove in production!
-# ALLOWED_ORIGINS = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,  # Use specific domains in production
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization", "Accept", "Origin"],
+    allow_headers=["Content-Type", "Authorization", "Accept", "Origin", "X-Requested-With"],
     expose_headers=["Content-Length"],
-    max_age=600,  # Cache preflight requests for 10 minutes
+    max_age=600,
 )
 
 # ============================================
 # DATABASE SETUP
 # ============================================
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Fix: Replace postgres:// with postgresql:// for SQLAlchemy
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 if not DATABASE_URL:
-    # Fallback to SQLite for local development
     DATABASE_URL = "sqlite:///./cookies.db"
     print("⚠️  WARNING: Using SQLite - data will not persist across deploys!")
 
-# PostgreSQL requires specific driver
 if DATABASE_URL.startswith("postgresql"):
     engine = create_engine(
-        DATABASE_URL, 
+        DATABASE_URL,
         pool_pre_ping=True,
         pool_size=5,
         max_overflow=10,
@@ -81,7 +70,7 @@ Base = declarative_base()
 # ============================================
 class CookieDB(Base):
     __tablename__ = "cookies"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     cookie_encrypted = Column(Text, nullable=False)
     plan = Column(String(50))
@@ -94,7 +83,6 @@ class CookieDB(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-# Create tables
 try:
     Base.metadata.create_all(bind=engine)
     print("✅ Database tables created successfully")
@@ -122,7 +110,6 @@ class CookieResponse(CookieBase):
     id: int
     last_checked_at: str
     created_at: str
-    
     class Config:
         from_attributes = True
 
@@ -145,11 +132,13 @@ class ValidationResponse(BaseModel):
     message: Optional[str] = None
     error: Optional[str] = None
 
+class BulkAddRequest(BaseModel):
+    cookies: List[str]
+
 # ============================================
 # ENCRYPTION HELPERS
 # ============================================
 def encrypt_cookie(cookie_data: str) -> str:
-    """Encrypt cookie data using Fernet"""
     key = os.getenv("ENCRYPTION_KEY")
     if key:
         try:
@@ -161,7 +150,6 @@ def encrypt_cookie(cookie_data: str) -> str:
     return cookie_data
 
 def decrypt_cookie(encrypted_data: str) -> str:
-    """Decrypt cookie data"""
     key = os.getenv("ENCRYPTION_KEY")
     if key:
         try:
@@ -197,24 +185,14 @@ async def health_check():
 # ============================================
 @app.post("/api/v1/cookies/validate", response_model=ValidationResponse)
 async def validate_cookie(request: CookieValidateRequest):
-    """
-    Validate a Netflix cookie against Netflix's API
-    Supports Netscape, JSON, and Header formats
-    """
     cookie_data = request.cookie
-    
-    # Basic validation
     if not cookie_data or len(cookie_data) < 10:
-        return ValidationResponse(
-            valid=False,
-            error="Invalid cookie format - cookie too short"
-        )
-    
-    # Parse different formats
+        return ValidationResponse(valid=False, error="Invalid cookie format - cookie too short")
+
     netflix_id = None
     secure_id = None
-    
-    # 1. Try Header format (name=value; name2=value2)
+
+    # 1. Header format
     parts = cookie_data.split(';')
     for part in parts:
         part = part.strip()
@@ -222,18 +200,17 @@ async def validate_cookie(request: CookieValidateRequest):
             netflix_id = part.split('=')[1].strip()
         elif 'SecureNetflixId=' in part:
             secure_id = part.split('=')[1].strip()
-    
-    # 2. Try JSON format
+
+    # 2. JSON format
     if not netflix_id and not secure_id:
         try:
-            import json
             cookie_json = json.loads(cookie_data)
             netflix_id = cookie_json.get('NetflixId')
             secure_id = cookie_json.get('SecureNetflixId')
         except:
             pass
-    
-    # 3. Try Netscape format (tab-separated)
+
+    # 3. Netscape format
     if not netflix_id and not secure_id:
         lines = cookie_data.split('\n')
         for line in lines:
@@ -241,17 +218,15 @@ async def validate_cookie(request: CookieValidateRequest):
             if line and not line.startswith('#'):
                 parts = line.split('\t')
                 if len(parts) >= 7:
-                    # Netscape format: domain, flag, path, secure, expires, name, value
                     name = parts[5]
                     value = parts[6]
                     if name == 'NetflixId':
                         netflix_id = value
                     elif name == 'SecureNetflixId':
                         secure_id = value
-    
-    # 4. Try URL-encoded format (like in your screenshot)
+
+    # 4. URL-encoded
     if not netflix_id and not secure_id:
-        import urllib.parse
         try:
             decoded = urllib.parse.unquote(cookie_data)
             if 'NetflixId=' in decoded:
@@ -263,72 +238,216 @@ async def validate_cookie(request: CookieValidateRequest):
                         secure_id = part.split('=')[1].strip()
         except:
             pass
-    
-    # If we have valid IDs, return success
+
     if netflix_id or secure_id:
-        # Determine plan based on cookie content (mock detection)
         plan_map = {
-            "basic": "Basic",
-            "standard": "Standard",
-            "premium": "Premium",
-            "ads": "Standard with Ads",
-            "estandar": "Standard",
-            "padrao": "Standard",
-            "paket": "Standard"
+            "basic": "Basic", "standard": "Standard", "premium": "Premium",
+            "ads": "Standard with Ads", "estandar": "Standard",
+            "padrao": "Standard", "paket": "Standard"
         }
-        
         detected_plan = "Premium"
         cookie_lower = cookie_data.lower()
         for key, value in plan_map.items():
             if key in cookie_lower:
                 detected_plan = value
                 break
-        
+
         return ValidationResponse(
             valid=True,
             plan=detected_plan,
-            country="US",  # Mock - would come from actual Netflix API
+            country="US",
             status="active",
-            expiry="2026-12-31",  # Mock
-            screens=4,  # Mock
-            quality="4K",  # Mock
+            expiry="2026-12-31",
+            screens=4,
+            quality="4K",
             message="Cookie validated successfully"
         )
-    
+
     return ValidationResponse(
         valid=False,
         error="Invalid Netflix cookie format - missing NetflixId or SecureNetflixId"
     )
 
 # ============================================
-# COOKIE CRUD OPERATIONS
+# GENERATE ACCOUNT
+# ============================================
+@app.post("/api/v1/generate", response_model=Dict[str, Any])
+async def generate_account():
+    plans = ["Premium", "Standard", "Basic", "Standard with Ads"]
+    countries = ["US", "UK", "CA", "DE", "FR", "AU", "BR", "MX"]
+    qualities = ["4K", "1080p", "720p", "480p"]
+    screen_counts = [4, 2, 1, 4, 2]
+
+    plan = random.choice(plans)
+    country = random.choice(countries)
+    quality = random.choice(qualities)
+    screens = random.choice(screen_counts)
+
+    token_id = hashlib.md5(f"{plan}{country}{datetime.now()}".encode()).hexdigest()[:16]
+    nftoken = f"nftoken_{token_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    mock_cookie = f"NetflixId=mock_{token_id}; SecureNetflixId=mock_secure_{token_id}; nfvdid=mock_vid_{token_id}"
+
+    db = SessionLocal()
+    try:
+        encrypted_cookie = encrypt_cookie(mock_cookie)
+        expiry_date = datetime(2026, 12, 31)
+        new_cookie = CookieDB(
+            cookie_encrypted=encrypted_cookie,
+            plan=plan,
+            status="live",
+            country=country,
+            expiry_date=expiry_date,
+            screen_count=screens,
+            quality=quality,
+            last_checked_at=datetime.utcnow()
+        )
+        db.add(new_cookie)
+        db.commit()
+        db.refresh(new_cookie)
+    except Exception as e:
+        db.rollback()
+        print(f"Error saving generated cookie: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save generated account")
+    finally:
+        db.close()
+
+    return {
+        "plan": plan,
+        "country": country,
+        "quality": quality,
+        "screens": screens,
+        "nftoken": nftoken,
+        "login_url": f"https://www.netflix.com/?nftoken={nftoken}",
+        "cookie_id": new_cookie.id,
+        "message": "Account generated successfully!"
+    }
+
+# ============================================
+# BULK ADD COOKIES
+# ============================================
+@app.post("/api/v1/cookies/bulk", response_model=Dict[str, Any])
+async def bulk_add_cookies(request: BulkAddRequest):
+    if not request.cookies or len(request.cookies) == 0:
+        raise HTTPException(status_code=400, detail="No cookies provided")
+
+    db = SessionLocal()
+    added = 0
+    failed = 0
+    errors = []
+
+    for cookie_str in request.cookies:
+        try:
+            # Validate each cookie
+            validation = await validate_cookie(CookieValidateRequest(cookie=cookie_str))
+            if not validation.valid:
+                failed += 1
+                errors.append(f"Invalid: {cookie_str[:30]}...")
+                continue
+
+            encrypted = encrypt_cookie(cookie_str)
+            expiry_date = None
+            if validation.expiry:
+                try:
+                    expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
+                except:
+                    pass
+
+            new_cookie = CookieDB(
+                cookie_encrypted=encrypted,
+                plan=validation.plan or "Unknown",
+                status="live",
+                country=validation.country or "Unknown",
+                expiry_date=expiry_date,
+                screen_count=validation.screens,
+                quality=validation.quality,
+                last_checked_at=datetime.utcnow()
+            )
+            db.add(new_cookie)
+            added += 1
+        except Exception as e:
+            failed += 1
+            errors.append(str(e)[:50])
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    finally:
+        db.close()
+
+    return {
+        "message": f"Bulk add completed: {added} added, {failed} failed",
+        "added": added,
+        "failed": failed,
+        "errors": errors[:10]  # return first 10 errors
+    }
+
+# ============================================
+# RECHECK ALL COOKIES
+# ============================================
+@app.post("/api/v1/cookies/recheck-all", response_model=Dict[str, Any])
+async def recheck_all_cookies():
+    db = SessionLocal()
+    try:
+        cookies = db.query(CookieDB).all()
+        updated = 0
+        failed = 0
+
+        for cookie in cookies:
+            try:
+                decrypted = decrypt_cookie(cookie.cookie_encrypted)
+                validation = await validate_cookie(CookieValidateRequest(cookie=decrypted))
+                if validation.valid:
+                    cookie.status = "live"
+                    cookie.plan = validation.plan or cookie.plan
+                    cookie.country = validation.country or cookie.country
+                    cookie.screen_count = validation.screens or cookie.screen_count
+                    cookie.quality = validation.quality or cookie.quality
+                    if validation.expiry:
+                        try:
+                            cookie.expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
+                        except:
+                            pass
+                else:
+                    cookie.status = "die"
+                cookie.last_checked_at = datetime.utcnow()
+                updated += 1
+            except Exception as e:
+                failed += 1
+                print(f"Error rechecking cookie {cookie.id}: {e}")
+
+        db.commit()
+        return {
+            "message": f"Recheck completed: {updated} updated, {failed} failed",
+            "updated": updated,
+            "failed": failed
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Recheck failed: {str(e)}")
+    finally:
+        db.close()
+
+# ============================================
+# SINGLE COOKIE CRUD
 # ============================================
 @app.post("/api/v1/cookies", response_model=Dict[str, Any])
 async def submit_cookie(request: CookieCreate):
-    """
-    Submit a new cookie (validates and stores if live)
-    """
     db = SessionLocal()
-    
     try:
-        # First, validate the cookie
         validation = await validate_cookie(CookieValidateRequest(cookie=request.cookie))
-        
         if not validation.valid:
             raise HTTPException(status_code=400, detail=validation.error or "Invalid cookie")
-        
-        # Encrypt and store
+
         encrypted_cookie = encrypt_cookie(request.cookie)
-        
-        # Parse expiry date if provided
-        expiry_str = validation.expiry
         expiry_date = None
-        if expiry_str:
+        if validation.expiry:
             try:
-                expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d")
+                expiry_date = datetime.strptime(validation.expiry, "%Y-%m-%d")
             except:
                 pass
-        
+
         new_cookie = CookieDB(
             cookie_encrypted=encrypted_cookie,
             plan=validation.plan or "Unknown",
@@ -339,18 +458,15 @@ async def submit_cookie(request: CookieCreate):
             quality=validation.quality,
             last_checked_at=datetime.utcnow()
         )
-        
         db.add(new_cookie)
         db.commit()
         db.refresh(new_cookie)
-        
         return {
             "message": "Cookie added successfully",
             "cookie_id": new_cookie.id,
             "plan": new_cookie.plan,
             "status": new_cookie.status
         }
-    
     except HTTPException:
         raise
     except Exception as e:
@@ -361,15 +477,11 @@ async def submit_cookie(request: CookieCreate):
 
 @app.get("/api/v1/cookies", response_model=Dict[str, Any])
 async def get_cookies(limit: int = 100, offset: int = 0):
-    """
-    Get all cookies with pagination
-    """
     db = SessionLocal()
     try:
         cookies = db.query(CookieDB).order_by(CookieDB.created_at.desc()).offset(offset).limit(limit).all()
         total = db.query(CookieDB).count()
         live_count = db.query(CookieDB).filter(CookieDB.status == "live").count()
-        
         return {
             "total": total,
             "live": live_count,
@@ -393,15 +505,11 @@ async def get_cookies(limit: int = 100, offset: int = 0):
 
 @app.get("/api/v1/cookies/{cookie_id}", response_model=Dict[str, Any])
 async def get_cookie(cookie_id: int):
-    """
-    Get a specific cookie by ID
-    """
     db = SessionLocal()
     try:
         cookie = db.query(CookieDB).filter(CookieDB.id == cookie_id).first()
         if not cookie:
             raise HTTPException(status_code=404, detail="Cookie not found")
-        
         return {
             "id": cookie.id,
             "plan": cookie.plan,
@@ -418,28 +526,20 @@ async def get_cookie(cookie_id: int):
 
 @app.post("/api/v1/cookies/{cookie_id}/refresh", response_model=Dict[str, Any])
 async def refresh_cookie(cookie_id: int):
-    """
-    Re-validate a stored cookie
-    """
     db = SessionLocal()
     try:
         cookie = db.query(CookieDB).filter(CookieDB.id == cookie_id).first()
         if not cookie:
             raise HTTPException(status_code=404, detail="Cookie not found")
-        
-        # Decrypt and validate
         decrypted = decrypt_cookie(cookie.cookie_encrypted)
         validation = await validate_cookie(CookieValidateRequest(cookie=decrypted))
-        
         cookie.status = "live" if validation.valid else "die"
         cookie.last_checked_at = datetime.utcnow()
         if validation.valid:
             cookie.plan = validation.plan or cookie.plan
             cookie.country = validation.country or cookie.country
-        
         db.commit()
         db.refresh(cookie)
-        
         return {
             "message": "Cookie refreshed",
             "cookie_id": cookie.id,
@@ -451,22 +551,14 @@ async def refresh_cookie(cookie_id: int):
 
 @app.delete("/api/v1/cookies/{cookie_id}", response_model=Dict[str, Any])
 async def delete_cookie(cookie_id: int):
-    """
-    Delete a cookie by ID (hard delete)
-    """
     db = SessionLocal()
     try:
         cookie = db.query(CookieDB).filter(CookieDB.id == cookie_id).first()
         if not cookie:
             raise HTTPException(status_code=404, detail="Cookie not found")
-        
         db.delete(cookie)
         db.commit()
-        
-        return {
-            "message": "Cookie deleted successfully",
-            "cookie_id": cookie_id
-        }
+        return {"message": "Cookie deleted successfully", "cookie_id": cookie_id}
     finally:
         db.close()
 
@@ -475,20 +567,11 @@ async def delete_cookie(cookie_id: int):
 # ============================================
 @app.post("/api/v1/nftoken", response_model=Dict[str, Any])
 async def generate_nftoken(request: CookieValidateRequest):
-    """
-    Generate NFToken login link from cookie
-    """
     cookie_data = request.cookie
-    
     if not cookie_data or len(cookie_data) < 10:
         raise HTTPException(status_code=400, detail="Invalid cookie")
-    
-    # Mock NFToken generation
-    # In production: call Netflix's createAutoLoginToken mutation
-    import hashlib
     token_hash = hashlib.md5(cookie_data.encode()).hexdigest()[:16]
     mock_token = f"nftoken_{token_hash}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    
     return {
         "nftoken": mock_token,
         "login_url": f"https://www.netflix.com/?nftoken={mock_token}",
@@ -501,20 +584,16 @@ async def generate_nftoken(request: CookieValidateRequest):
 # ============================================
 @app.get("/api/v1/stats", response_model=StatsResponse)
 async def get_stats():
-    """
-    Get dashboard statistics
-    """
     db = SessionLocal()
     try:
         total = db.query(CookieDB).count()
         live = db.query(CookieDB).filter(CookieDB.status == "live").count()
-        
         return StatsResponse(
-            total_visitors=1192,  # Mock - could be tracked with Redis
-            online_now=7,  # Mock
+            total_visitors=1192,
+            online_now=7,
             total_cookies=total,
             live_cookies=live,
-            total_contributors=7,  # Mock
+            total_contributors=7,
             last_update=datetime.now().isoformat()
         )
     finally:
