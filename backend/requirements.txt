@@ -8,3 +8,7 @@ pydantic==2.5.0
 cryptography==41.0.7
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
+# Netflix-Cookie-Checker dependencies
+cloudscraper==1.2.71
+requests==2.31.0
+colorama==0.4.6

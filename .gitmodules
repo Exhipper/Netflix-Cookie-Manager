@@ -1,0 +1,3 @@
+[submodule "backend/checker"]
+	path = backend/checker
+	url = https://github.com/harshitkamboj/Netflix-Cookie-Checker.git
